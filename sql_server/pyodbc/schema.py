@@ -49,6 +49,8 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     sql_delete_table = "DROP TABLE %(table)s"
     sql_rename_column = "EXEC sp_rename '%(table)s.%(old_column)s', %(new_column)s, 'COLUMN'"
     sql_rename_table = "EXEC sp_rename %(old_table)s, %(new_table)s"
+    sql_create_unique_null = "CREATE UNIQUE INDEX %(name)s ON %(table)s(%(columns)s) " \
+                             "WHERE %(columns)s IS NOT NULL"
 
     def _alter_column_type_sql(self, table, old_field, new_field, new_type):
         new_type = self._set_field_new_type_null_status(old_field, new_type)
@@ -79,15 +81,18 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         # Has unique been removed?
         if old_field.unique and (not new_field.unique or (not old_field.primary_key and new_field.primary_key)):
             # Find the unique constraint for this field
-            constraint_names = self._constraint_names(model, [old_field.column], unique=True)
-            if strict and len(constraint_names) != 1:
+            index_names = self._constraint_names(model, [old_field.column], unique=True, index=True)
+            constraint_names = self._constraint_names(model, [old_field.column], unique=True, index=False)
+            if strict and len(index_names) + len(constraint_names) != 1:
                 raise ValueError("Found wrong number (%s) of unique constraints for %s.%s" % (
-                    len(constraint_names),
+                    len(index_names) + len(constraint_names),
                     model._meta.db_table,
                     old_field.column,
                 ))
             for constraint_name in constraint_names:
                 self.execute(self._delete_constraint_sql(self.sql_delete_unique, model, constraint_name))
+            for index_name in index_names:
+                self.execute(self._delete_constraint_sql(self.sql_delete_index, model, index_name))
         # Drop incoming FK constraints if we're a primary key and things are going
         # to change.
         if old_field.primary_key and new_field.primary_key and old_type != new_type:
@@ -253,7 +258,14 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                 self.execute(sql, params)
         # Added a unique?
         if not old_field.unique and new_field.unique:
-            self.execute(self._create_unique_sql(model, [new_field.column]))
+            if new_field.null:
+                self.execute(
+                    self._create_index_sql(
+                        model, [new_field], sql=self.sql_create_unique_null, suffix="_uniq"
+                    )
+                )
+            else:
+                self.execute(self._create_unique_sql(model, [new_field.column]))
         # Added an index?
         # constraint will no longer be used in lieu of an index. The following
         # lines from the truth table show all True cases; the rest are False:
@@ -442,6 +454,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         # It might not actually have a column behind it
         if definition is None:
             return
+        if field.null and field.unique:
+            definition = definition.replace(' UNIQUE', '')
+            self.deferred_sql.append(self._create_index_sql(
+                model, [field], sql=self.sql_create_unique_null, suffix="_uniq"
+            ))
         # Check constraints can go on the column SQL here
         db_params = field.db_parameters(connection=self.connection)
         if db_params['check']:
@@ -495,6 +512,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             definition, extra_params = self.column_sql(model, field)
             if definition is None:
                 continue
+            if field.null and field.unique:
+                definition = definition.replace(' UNIQUE', '')
+                self.deferred_sql.append(self._create_index_sql(
+                    model, [field], sql=self.sql_create_unique_null, suffix="_uniq"
+                ))
             # Check constraints can go on the column SQL here
             db_params = field.db_parameters(connection=self.connection)
             if db_params['check']:
@@ -679,7 +701,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                 })
         # Drop unique constraints, SQL Server requires explicit deletion
         for name, infodict in constraints.items():
-            if field.column in infodict['columns'] and infodict['unique'] and not infodict['primary_key']:
+            if field.column in infodict['columns'] and infodict['unique'] and not infodict['primary_key'] and not infodict['index']:
                 self.execute(self.sql_delete_unique % {
                     "table": self.quote_name(model._meta.db_table),
                     "name": self.quote_name(name),
