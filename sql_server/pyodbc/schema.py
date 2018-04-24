@@ -124,6 +124,12 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         new_type = self._set_field_new_type_null_status(old_field, new_type)
         return super()._alter_column_type_sql(model, old_field, new_field, new_type)
 
+    def _delete_index_sql(self, template, model, name):
+        return template % {
+            "table": self.quote_name(model._meta.db_table),
+            "name": self.quote_name(name),
+        }
+
     def _alter_field(self, model, old_field, new_field, old_type, new_type,
                      old_db_params, new_db_params, strict=False):
         """Actually perform a "physical" (non-ManyToMany) field update."""
@@ -155,8 +161,10 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         # Has unique been removed?
         if old_field.unique and (not new_field.unique or (not old_field.primary_key and new_field.primary_key)):
             # Find the unique constraint for this field
-            constraint_names = self._constraint_names(model, [old_field.column], unique=True)
-            if strict and len(constraint_names) != 1:
+            constraint_names = self._constraint_names(model, [old_field.column], unique=True, index=False)
+            index_names = self._constraint_names(model, [old_field.column], unique=True, index=True)
+
+            if strict and (len(constraint_names) + len(index_names)) != 1:
                 raise ValueError("Found wrong number (%s) of unique constraints for %s.%s" % (
                     len(constraint_names),
                     model._meta.db_table,
@@ -164,6 +172,8 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                 ))
             for constraint_name in constraint_names:
                 self.execute(self._delete_constraint_sql(self.sql_delete_unique, model, constraint_name))
+            for index_name in index_names:
+                self.execute(self._delete_index_sql(self.sql_delete_index, model, index_name))
         # Drop incoming FK constraints if the field is a primary key or unique,
         # which might be a to_field target, and things are going to change.
         drop_foreign_keys = (
