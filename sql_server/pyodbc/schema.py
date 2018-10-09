@@ -2,7 +2,7 @@ import binascii
 import datetime
 
 from django.db.backends.base.schema import (
-    BaseDatabaseSchemaEditor, logger, _related_non_m2m_objects,
+    BaseDatabaseSchemaEditor, logger, _is_relevant_relation, _related_non_m2m_objects,
 )
 from django.db.backends.ddl_references import (
     Statement,
@@ -159,7 +159,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
                 fks_dropped.add((old_field.column,))
                 self.execute(self._delete_constraint_sql(self.sql_delete_fk, model, fk_name))
         # Has unique been removed?
-        if old_field.unique and (not new_field.unique or (not old_field.primary_key and new_field.primary_key)):
+        if old_field.unique and (not new_field.unique or self._field_became_primary_key(old_field, new_field)):
             # Find the unique constraint for this field
             constraint_names = self._constraint_names(model, [old_field.column], unique=True, index=False)
             index_names = self._constraint_names(model, [old_field.column], unique=True, index=True)
@@ -213,12 +213,11 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             # db_index=True.
             index_names = self._constraint_names(model, [old_field.column], index=True, type_=Index.suffix)
             for index_name in index_names:
-                if index_name in meta_index_names:
+                if index_name not in meta_index_names:
                     # The only way to check if an index was created with
                     # db_index=True or with Index(['field'], name='foo')
                     # is to look at its name (refs #28053).
-                    continue
-                self.execute(self._delete_constraint_sql(self.sql_delete_index, model, index_name))
+                    self.execute(self._delete_constraint_sql(self.sql_delete_index, model, index_name))
         # Drop any unique nullable index/constraints, we'll remake them later if need be
         if old_field.unique and old_field.null:
             index_names = self._constraint_names(model, [old_field.column], unique=True, index=True)
@@ -383,11 +382,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         if old_field.primary_key and new_field.primary_key and old_type != new_type:
             rels_to_update.extend(_related_non_m2m_objects(old_field, new_field))
         # Changed to become primary key?
-        # Note that we don't detect unsetting of a PK, as we assume another field
-        # will always come along and replace it.
-        if not old_field.primary_key and new_field.primary_key:
-            # First, drop the old PK
-            self._delete_primary_key(model, strict)
+        if self._field_became_primary_key(old_field, new_field):
             # Make the new one
             self.execute(
                 self.sql_create_pk % {
@@ -424,7 +419,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         # Rebuild FKs that pointed to us if we previously had to drop them
         if drop_foreign_keys:
             for rel in new_field.model._meta.related_objects:
-                if not rel.many_to_many and rel.field.db_constraint:
+                if _is_relevant_relation(rel, new_field) and rel.field.db_constraint:
                     self.execute(self._create_fk_sql(rel.related_model, rel.field, "_fk"))
         # Does it have check constraints we need to add?
         if (old_db_params['check'] != new_db_params['check'] and new_db_params['check']) or (
@@ -767,7 +762,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         # Reset connection if required
         if self.connection.features.connection_persists_old_columns:
             self.connection.close()
-        # Remove all deferred statements referencing the deleted table.
+        # Remove all deferred statements referencing the deleted column.
         for sql in list(self.deferred_sql):
             if isinstance(sql, Statement) and sql.references_column(model._meta.db_table, field.column):
                 self.deferred_sql.remove(sql)
